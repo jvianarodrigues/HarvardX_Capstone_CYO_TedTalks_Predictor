@@ -1,0 +1,1098 @@
+---
+title: "TED Talks Popularity Predictor"
+subtitle: "HardvardX Professional Certificate in Data Science - Capstone Project 2 - CYO"
+author: "Joao Rodrigues"
+date: "17 June 2019"
+output: 
+  html_document:
+    fig_caption: true
+    fig_width: 4
+    fig_height: 3
+params:
+  subset_of_edx: 1
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+options(tinytex.verbose = TRUE)
+```
+
+## 1. Executive summary
+This report documents the analytical approach, modelling results and proposed next steps for the HarvardX Data Science Capstone CYO Project. This project analyses the TED Talks dataset and identifies predictors of the popularity of talks. This has commercial application in media and content programming, e.g. predicting the popularity of speakers and their topics on broadcast shows of various formats (television, podcast, radio). Some of the dimensions modelled to predict popularity include: the topic of the talks (tags), ratings, sentiment analysis on the transcripts, talk duration and speed of delivery (words/minute), and number of comments. Predictive models were built using knn and random forest methodologies. The modelling approach predicts the quartile of views that a given TED Talk topic is expected to fall into. Results are segmented into 2 training datasets - one set that includes parameters only available after the talk has screened (e.g. comments, ratings) and a second set that only models for parameters known at date of publication (e.g. topic of talks, sentiment analysis of the transcript, etc.)
+
+## 2. Objectives of this analysis
+This project sets out to demonstrate an appropriate approach to data exploration, and application of select machine learning algorithms to predict popularity of talks from the TED Talks. Specifically, this project demonstrates:
+
+*	Data pre-processing (especially text wrangling to extract subject topics for talks, ratings data, and sentiment analysis on the transcripts)
+* Exploratory data analysis to dimension the dataset and test for various correlations to the number of views that a talk attracts
+*	The application of machine learning algorithms to predict, based on relevant factors, the popularity of talks (as measured by the quartile of views that a talk falls into)
+ 
+
+## 3. Methodology
+### 3.1. Preprocessing 
+#### 3.1.1. Introduction to the TED Talks datasets - main data set and transcripts 
+
+``` {r initialise_data, echo=FALSE, message=FALSE, warning=FALSE}
+#Initialise data
+
+library(tidyverse)
+library(knitr)
+
+setwd("Y:\\JRodrigues\\Knowledge\\Data Science\\Harvardx\\Course examples\\Module 9 - capstone 2")
+ted_main_data = read.csv("./ted-talks/ted_main.csv",header=TRUE,stringsAsFactors = TRUE)
+ted_transcripts_data=read.csv("./ted-talks/transcripts.csv",header=TRUE,stringsAsFactors = FALSE)
+
+
+```
+
+This project explores 2 primary datasets, `ted_main_data` and `ted_transcript_data`. As per the below code, the ted_main_data dataset is a matrix with `r nrow(ted_main_data)` observations and `r ncol(ted_main_data)` variables. 
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+#display ted_main_data and dimensions
+glimpse(ted_main_data)
+```
+
+The `ted_transcript_data` dataset is a matrix with `r nrow(ted_transcripts_data)` observations and `r ncol(ted_transcripts_data)` variables
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+#display ted_transcripts_data and dimensions
+glimpse(ted_transcripts_data)
+```
+
+Given the intent to use transcripts analysis as a core part of the prediction algorithm later, we slightly reduce the `ted_main_data` observations to ensure we have transcripts for all observations, using the `semi_join()` coding below . . .
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+# ensure we have transcripts for all
+ted_main_data <- semi_join(ted_main_data, ted_transcripts_data, by = "url")
+```
+
+. . . and confirm that all these remaining observations (`r nrow(ted_main_data)`) are complete cases.
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+# remove duplicate entries in transcripts
+ted_transcripts_data <- distinct(ted_transcripts_data)
+
+#sort both by url
+ted_transcripts_data <- ted_transcripts_data[order(match(ted_transcripts_data$url, ted_main_data$url)), ]
+
+# check for complete cases on all data
+sum(complete.cases(ted_main_data))-nrow(ted_main_data)
+```
+
+
+#### 3.1.2. Pre-processing to separate tags by TED Talk into a matrix
+The `tags` field in the main dataset records the multiple topics that a specific talk relates to. Text wrangling per the below code separates the unique tag words into a vector and then collapses to the unique tag names with the `ndistinct()` dplyr function per below: 
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+# calc max_no_of_tags
+tags_tidy <- ted_main_data$tags %>% 
+  as.character() %>% 
+  strsplit(., ", ") %>% 
+  unlist() %>% 
+  gsub("[[:punct:]]", "", .) %>% 
+  enframe()
+
+#n_distinct(tags_tidy)
+tags_distinct <- tags_tidy %>% group_by(value) %>% summarize(n = n()) %>% arrange(desc(n))
+#n_distinct(tags_distinct)
+tags_matrix <- matrix(nrow = nrow(ted_main_data), ncol = nrow(tags_distinct))
+```
+
+A `tags_matrix` is then created and each TED Talk observation has a boolean flag indicating whether the specific talk covers that tagged topic or not. 
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+for (i in 1:nrow(ted_main_data)) {
+  for (j in 1:nrow(tags_distinct)){
+        tags_matrix[i, j] <- str_detect(as.character(ted_main_data$tags[i]), paste("\'", as.character(tags_distinct[j, 1]), "\'", sep = ""))  
+  }
+}
+colnames(tags_matrix) <- unlist(tags_distinct[1:nrow(tags_distinct), "value"])
+```
+
+This matrix of tags, of dimensions `r nrow(tags_matrix)` rows and `r ncol(tags_matrix)` distinct tags, will be column bound to the `ted_main_data dataset` later for further predictive analysis.
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+glimpse(tags_matrix)
+```
+
+#### 3.1.3. Separate ratings into unique rating names and counts
+The ratings data in `ted_main_data` is factorized vector of concatenated strings that contain multiple ratings categories and counts of ratings per category. The text wrangling strips out header information and punctuation, and transforms this dataset into a matrix comprised of a unique id for the rating type, the name of the rating type, and the count of that specific ratings. This involves a few processing steps to: 
+
+``` {r extract_ratings, echo=FALSE, message=FALSE, warning=FALSE}
+# 2.3. extract a 14 row x nrow(ted_main_data) col list of the the count of ratings scores for each ted talk, in a string of format "id number, description, number of ratings"
+
+list_summary_ratings <- sapply(ted_main_data$ratings[1:nrow(ted_main_data)], function(x) {
+    x <- x %>%
+    str_replace(., "^\\[", "") %>%
+    str_replace(., "\\]$", "") %>%
+    str_replace_all(., "\\'id\': |\'name\': |\'count\': ", "") %>%
+    str_replace_all(., "[[:blank:]]", "") %>%
+    str_split(., "\\}") %>%
+    unlist() %>%
+    str_replace(., ",\\{|\\{", "")
+})
+list_summary_ratings <- list_summary_ratings %>% t()
+#dim(list_summary_ratings)
+rownames(list_summary_ratings) <- ted_main_data$url[1:nrow(ted_main_data)]
+
+#create a function to transform the string of ratings scores into a dataframe with id, desc, no of ratings
+rating_df <- function(x) {
+      temp_str_vector <- unlist(str_split(x, ","))
+      data.frame (id = as.integer(temp_str_vector[1]), 
+      rating_type = str_replace_all(temp_str_vector[2], "[[:punct:]]", ""),
+      no_of_ratings = as.numeric(temp_str_vector[3]))
+    }
+
+#initialise a blank dataframe
+ted_talks_ratings_all <- data.frame(id = integer(), 
+                                    rating_type = character(), 
+                                    no_of_ratings = numeric())
+
+#create a loop that applies the function to the ratings listing (string format) and converts to a long dataframe with all the data
+for (i in 1:nrow(ted_main_data)) { #loop for each ted talk
+ for (j in 1:length(list_summary_ratings[1, ])-1) #loop for each rating entry per ted talk
+  {
+  ted_talks_ratings_all <- rbind(ted_talks_ratings_all, rating_df(list_summary_ratings[i, j]))
+  }
+}
+
+rating_types <- levels(ted_talks_ratings_all$rating_type)
+# after interim processing, restore punctuation to 1 of the key ratings categories
+rating_types[11] <- "Jaw-dropping"
+
+#create a matrix of nrow(ted_main_data) rows x n_distinct_rating types columns and populate with the views data  
+ted_main_data_ratings_matrix <- matrix(nrow = nrow(ted_main_data), ncol = n_distinct(ted_talks_ratings_all$rating_type))
+colnames(ted_main_data_ratings_matrix) <- rating_types
+
+for (i in 1:nrow(ted_main_data)) {
+  for (j in 1:n_distinct(ted_talks_ratings_all$rating_type))
+       {
+         #add code here to populate matrix of rating number by rating type from list_summary_ratings
+         ted_main_data_ratings_matrix[i, j] <- ifelse(str_detect(ted_main_data$ratings[i], rating_types[j]), 
+                                                      as.numeric(str_extract(str_extract(ted_main_data$ratings[i], paste("\'name\': \'", rating_types[j], "\', \'count\': \\d+\\}", sep="")), "\\d+")), 
+                                                      0)
+       }
+}
+
+```
+
+* extract a `r nrow(ted_main_data)` x `r n_distinct(ted_talks_ratings_all$rating_type)` column list of the count of ratings scores for each TED Talk, in a string of format "id number, description, number of ratings"
+* a function is defined to transform the string of ratings scores into a dataframe with `id`, `desc`, `no_of_ratings`
+* the function is applied to the long ratings listing (in string format) and converts to a tidy dataframe
+*	finally we define a matrix of `r nrow(ted_main_data)` rows x `r n_distinct(ted_talks_ratings_all$rating_type)` distinct ratings types in columns and populate with the ratings data.  
+
+This resultant matrix has the following structure: 
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+glimpse(ted_main_data_ratings_matrix)
+```
+
+. . . and will be used to test for predictive power in the exploratory data analysis and model training
+
+This pre-processing of the ratings data in `ted_main_data` is achieved with the following code chunk: 
+
+``` {r extract_ratings_show_code, echo=TRUE, eval = FALSE}
+#extract a 14 row x nrow(ted_main_data) col list of the the count of ratings scores for each ted talk, in a string of format "id number, description, number of ratings"
+
+list_summary_ratings <- sapply(ted_main_data$ratings[1:nrow(ted_main_data)], function(x) {
+    x <- x %>%
+    str_replace(., "^\\[", "") %>%
+    str_replace(., "\\]$", "") %>%
+    str_replace_all(., "\\'id\': |\'name\': |\'count\': ", "") %>%
+    str_replace_all(., "[[:blank:]]", "") %>%
+    str_split(., "\\}") %>%
+    unlist() %>%
+    str_replace(., ",\\{|\\{", "")
+})
+list_summary_ratings <- list_summary_ratings %>% t()
+rownames(list_summary_ratings) <- ted_main_data$url[1:nrow(ted_main_data)]
+
+#create a function to transform the string of ratings scores into a dataframe with id, desc, no of ratings
+rating_df <- function(x) {
+      temp_str_vector <- unlist(str_split(x, ","))
+      data.frame (id = as.integer(temp_str_vector[1]), 
+      rating_type = str_replace_all(temp_str_vector[2], "[[:punct:]]", ""),
+      no_of_ratings = as.numeric(temp_str_vector[3]))
+    }
+
+#initialise a blank dataframe
+ted_talks_ratings_all <- data.frame(id = integer(), 
+                                    rating_type = character(), 
+                                    no_of_ratings = numeric())
+
+#create a loop that applies the function to the ratings listing (string format) and converts to a long dataframe with all the data
+for (i in 1:nrow(ted_main_data)) { #loop for each ted talk
+ for (j in 1:length(list_summary_ratings[1, ])-1) #loop for each rating entry per ted talk
+  {
+  ted_talks_ratings_all <- rbind(ted_talks_ratings_all, rating_df(list_summary_ratings[i, j]))
+  }
+}
+
+rating_types <- levels(ted_talks_ratings_all$rating_type)
+# after interim processing, restore punctuation to one of the key ratings categories
+rating_types[11] <- "Jaw-dropping"
+
+#create a matrix of nrow(ted_main_data) rows x n_distinct_rating types columns and populate with the views data  
+ted_main_data_ratings_matrix <- matrix(nrow = nrow(ted_main_data), ncol = n_distinct(ted_talks_ratings_all$rating_type))
+colnames(ted_main_data_ratings_matrix) <- rating_types
+
+for (i in 1:nrow(ted_main_data)) {
+  for (j in 1:n_distinct(ted_talks_ratings_all$rating_type))
+       {
+         #add code here to populate matrix of rating number by rating type from list_summary_ratings
+         ted_main_data_ratings_matrix[i, j] <- ifelse(str_detect(ted_main_data$ratings[i], rating_types[j]), 
+                                                      as.numeric(str_extract(str_extract(ted_main_data$ratings[i], paste("\'name\': \'", rating_types[j], "\', \'count\': \\d+\\}", sep="")), "\\d+")), 
+                                                      0)}}
+```
+
+#### 3.1.4. Convert time stamps to UTC format
+The date fields (`film_date` and `published_date`) are converted from a UNIX timestamp into UTC format using the `lubridate` package as follows: 
+
+``` {r convert_time, echo=TRUE, message=FALSE, warning=FALSE}
+# convert time stamps into UTC format
+library(lubridate)
+ted_main_data$film_date <- as.Date(structure(ted_main_data$film_date, class = c("POSIXct", "POSIXt")))
+ted_main_data$published_date <- as.Date(structure(ted_main_data$published_date, class = c("POSIXct", "POSIXt")))
+```
+
+#### 3.1.5. Sentiment analysis on transcripts
+Finally, in terms of pre-processing, sentiment analysis is performed on transcripts using 2 lexicons. This is achieved with the following steps: 
+
+*	Unnesting individual words in the transcript, removing commonly used stop words that won't influence sentiment. Before subsetting further for sentiment words, the highest frequency words (after removing stop words) are as follows: 
+
+``` {r sentiment_analysis, echo=FALSE, message=FALSE, warning=FALSE}
+#sentiment analysis on transcripts
+library(tidytext)
+
+#create a subset of the large dataset of transcripts to test coding before full implementation across all
+sub_set_to_analyse = nrow(ted_transcripts_data)
+ted_transcripts_data_sample <- ted_transcripts_data[sample(1:nrow(ted_transcripts_data), size = sub_set_to_analyse, replace = FALSE), ]
+#unnest individual words in the transcript, remove commonly used stop words to reduce dataset size, summarize for repeat words
+tidy_transcript <- ted_transcripts_data_sample %>% 
+  unnest_tokens(word, transcript) %>% 
+  anti_join(stop_words, by = "word") %>%
+  group_by(url, word) %>%
+  summarize(n = n()) %>%
+  filter(word != "â")
+```  
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+#display top word counts
+tidy_transcript %>%
+  group_by(word) %>%
+  tally %>%
+  arrange(desc(n)) %>%
+  head(10)
+```
+
+
+*	Applying the `nrc` lexicon first, we inner join the `nrc` lexicon with that of the transcript data to yield a matrix with the TED Talk URL as the unique identifier, and the `nrc` sentiment count. `NRC` classifies certain words into 10 emotional groupings, e.g. anger, anticipation, disgust. The results of this sentiment analysis are shown below. This will furthermore allow testing of talk popularity based on relative mix of sentiments in the talk and the absolute count of emotive language. 
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+# nrc lexicon
+# inner join the sentiment associated with the matched words from the nrc lexicon 
+tidy_transcript_nrc_words <- tidy_transcript %>%
+  inner_join(get_sentiments("nrc"), by = "word")
+
+# summarise the sentiment data by ted talk, with URL as the unique identifier
+ted_transcript_sentiment_nrc <- tidy_transcript_nrc_words %>%
+  group_by(url, sentiment) %>%
+  summarize(n = n()) %>%
+  spread(key = sentiment, value = n)
+
+glimpse(ted_transcript_sentiment_nrc)
+
+```
+
+* Word cloud analysis of the `tidy_transcript_nrc_words` visualises the highest frequency words driving the sentiment analysis.
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE}
+#plot a wordcloud of the nrc sentiment words
+#install.packages(c("tm", "SnowballC", "wordcloud", "RColorBrewer", "RCurl", "XML"))
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(RColorBrewer)
+library(RCurl)
+
+wordcloud(tidy_transcript_nrc_words$word, min.freq = 1, max.words = 50, random.order = FALSE, random.color = FALSE, colors = "blue4")
+```
+
+*	Applying the `bing` lexicon next, this categorises a set of words into positive or negative sentiment, so we can also calculate the net positive or negative sentiment score as well as the sum of positive and negative sentiment words (again, a measure of emotive language in a given talk). 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+# bing lexicon
+# inner join the sentiment associated with the matched words from the nrc lexicon 
+tidy_transcript_bing_words <- tidy_transcript %>%
+  inner_join(get_sentiments("bing"), by = "word")
+
+# summarise the sentiment data by ted talk, with URL as the unique identifier
+ted_transcript_sentiment_bing <- tidy_transcript_bing_words %>%
+  group_by(url, sentiment) %>%
+  summarize(n = n()) %>%
+  spread(key = sentiment, value = n)
+
+glimpse(ted_transcript_sentiment_bing)
+```
+
+
+### 3.2. Exploratory data analysis 
+
+The `ted_main_data` matrix contains various numeric variables that give insight into the observation variability. 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+glimpse(ted_main_data)
+```
+
+A set of plots are mapped to quickly dimension various predictors (i.e., views, number of comments, talk duration, the number of languages in which the talk is available, the published date, and the number of speakers in a talk)
+
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+ted_main_data %>% ggplot(aes(x = views)) + geom_histogram(bins = 25, color = "blue4", fill = "cornflowerblue") + scale_x_log10() + xlab("log(10) of views") + ggtitle("Histogram of views")
+ted_main_data %>% ggplot(aes(x = comments)) + geom_histogram(bins = 25, color = "blue4", fill = "cornflowerblue") + scale_x_log10() + xlab("log(10) of comments") + ggtitle("Histogram of comments")
+ted_main_data %>% ggplot(aes(x = duration/60)) + geom_histogram(bins = 25, color = "blue4", fill = "cornflowerblue") + xlab("Talk duration (mins)") + ggtitle("Histogram of duration")
+ted_main_data %>% ggplot(aes(x = languages)) + geom_histogram(bins = 25, color = "blue4", fill = "cornflowerblue") + ggtitle("Histogram of languages")
+ted_main_data %>% ggplot(aes(x = published_date)) + geom_histogram(bins = 25, color = "blue4", fill = "cornflowerblue") + ggtitle("Histogram of published date")
+```
+
+*Table of number of talks given per speaker* 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+ted_main_data %>% group_by(num_speaker) %>% summarize(number_of_talks = n(), percent_of_talks = round(n()/nrow(ted_main_data)*100, 1)) %>% knitr::kable()
+```
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+
+#3.1. tags analysis - what are the most popular tags (by number, weighted by views per tag)?
+sum_of_tags_matrix <- sort(colSums(tags_matrix), decreasing = TRUE) 
+sum_of_tags_matrix_df <- data.frame(sum_of_tags = sum_of_tags_matrix, 
+                                    tag_name = names(sum_of_tags_matrix)) %>% 
+                                    mutate(cum_sum = cumsum(sum_of_tags), 
+                                           cum_percent = cum_sum/sum(sum_of_tags))
+
+```
+
+#### 3.2.1. Tags
+To analyse popular topics (exploring the `tags_matrix` created), we first note that `r sum(sum_of_tags_matrix_df$cum_percent <= 0.5)`  of the `r nrow(sum_of_tags_matrix_df)` total tags represent 50% of the total tags by number. The below plots shows those most common tags, and those least common for comparison. 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+
+sum_of_tags_matrix_df %>%
+  ggplot(aes(x = sum_of_tags)) + geom_histogram(binwidth = 25, color = "blue4", fill = "cornflowerblue") + ggtitle("Histogram of tag counts") + xlab("Count of tags")
+
+sum_of_tags_matrix_df %>% 
+    filter(cum_percent <= 0.5) %>% 
+    arrange(desc(sum_of_tags)) %>% 
+    ggplot(aes(reorder(x = tag_name, sum_of_tags), y = sum_of_tags)) + geom_col(colour = "blue4", fill = "cornflowerblue") + coord_flip() + xlab("Tag name")  + ylab("Occurance of tag name across all Ted Talks") + ggtitle("Pareto of most common tag names, descending")
+
+sum_of_tags_matrix_df %>% 
+  arrange(sum_of_tags) %>%
+  top_n(50) %>%
+  ggplot(aes(reorder(x = tag_name, sum_of_tags), y = sum_of_tags)) + geom_col(colour = "blue4", fill = "cornflowerblue") + coord_flip() + xlab("Tag name")  + ylab("Occurance of tag name across all Ted Talks") + ggtitle("Pareto of least common tag names, descending")
+
+```
+
+Different tags are, however, associated with talks with very different levels of viewership, thus this analysis is repeated where the tags are now weighted by the number of views of their associated talks. 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+
+# weighted tags by views
+weighted_tags_matrix <- tags_matrix * ted_main_data$views
+weighted_sum_of_tags_matrix <- sort(colSums(weighted_tags_matrix), decreasing = TRUE) 
+weighted_tags_matrix_df <- data.frame(wt_sum_of_tags = weighted_sum_of_tags_matrix, 
+                                    tag_name = names(weighted_sum_of_tags_matrix)) %>% 
+  mutate(cum_sum = cumsum(wt_sum_of_tags), 
+         cum_percent = cum_sum/sum(wt_sum_of_tags))
+
+weighted_tags_matrix_df %>%
+  ggplot(aes(x = wt_sum_of_tags)) + geom_histogram(bins = 100, color = "blue4", fill = "cornflowerblue") + ggtitle("Histogram of tags weighted by views") + xlab("Tags weighted by views")
+
+weighted_tags_matrix_df %>% 
+  filter(cum_percent <= 0.5) %>% 
+  arrange(desc(wt_sum_of_tags)) %>% 
+  ggplot(aes(reorder(x = tag_name, wt_sum_of_tags), y = wt_sum_of_tags)) + geom_col(colour = "blue4", fill = "cornflowerblue") + coord_flip() + xlab("Tag name")  + ylab("tag count x number of views") + ggtitle("Pareto of most common tag names, weighted by views, descending")
+
+weighted_tags_matrix_df %>% 
+  arrange(wt_sum_of_tags) %>%
+  top_n(50) %>%
+  ggplot(aes(reorder(x = tag_name, wt_sum_of_tags), y = wt_sum_of_tags)) + geom_col(colour = "blue4", fill = "cornflowerblue") + coord_flip() + xlab("Tag name")  + ylab("tag count x number of views") + ggtitle("Pareto of least common tag names, weighted by views, descending")
+
+```
+
+#### 3.2.1. Ratings
+
+The ratings matrix across all talks records the frequency of ratings by rating type. The ratings are also broadly categorized into positive and negative ratings, as per the below code: 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+#plot histogram of number of ratings per views
+data.frame(x = rowSums(ted_main_data_ratings_matrix)) %>% 
+  ggplot(aes(x = x)) + 
+  geom_histogram(bins = 25, color = "blue4", fill = "cornflowerblue") + 
+  scale_x_log10() +
+  xlab("log (10) of number of ratings per TED Talk") + 
+  ylab("number of TED Talks") + 
+  ggtitle("Histogram of ratings per TED Talk")
+
+# Display core statistics on the total ratings distribution
+data.frame(x = rowSums(ted_main_data_ratings_matrix)) %>% summarize(mean = mean(x), median = median(x), sd = sd(x)) %>% kable()
+```
+
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+# assigns a positive (TRUE) or negative (FALSE) flag to each of the ratings categories
+ratings_sentiment <- c(TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, TRUE, TRUE, FALSE, TRUE, TRUE, FALSE, FALSE, TRUE) 
+cbind(colnames(ted_main_data_ratings_matrix), ratings_sentiment) %>% kable 
+```
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+#plot count of ratings, grouped by sentiment 
+data.frame(num = colSums(ted_main_data_ratings_matrix), 
+           names = colnames(ted_main_data_ratings_matrix), 
+           sentiment = ratings_sentiment) %>%
+    mutate(rating_sentiment = ifelse(sentiment, "Positive", "Negative")) %>%
+    ggplot(aes(x = reorder(names, -num), y = num)) + geom_col(aes(fill = rating_sentiment)) +
+    xlab("Rating category") + ylab("Number of ratings") + ggtitle("Summary of ratings per category") +
+    theme(axis.text.x = element_text(angle = 90))
+```
+
+#### 3.2.3. Correlations
+
+A set of parameters are selected to test correlations to `views` and hence predictive power. These various lenses on the dataset are listed below: 
+
+##### 3.2.3.1. Views vs. number of comments per TED Talk
+The hypothesis to test is that the more popular (i.e. more viewed) TED Talks will also attract a greater number of comments. We see some relationship in the below graph:
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+#3.3.1. comments
+ted_main_data %>%
+  ggplot(aes(x = comments, y = views)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE) + 
+  ggtitle("Views vs. number of comments") + 
+  xlab("number of comments per TED talk")
+```
+
+This graph shows far outliers, so the curve and data is re-run filtering out the top and bottom 1% of outliers.
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+ted_main_data %>%
+  filter(between(views, quantile(views, 0.01), quantile(views, 0.99))) %>%
+  filter(between(comments, quantile(comments, 0.01), quantile(comments, 0.99))) %>%
+  ggplot(aes(x = comments, y = views)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE) + 
+  ggtitle("Views vs. number of comments") + 
+  xlab("number of comments per TED talk") +
+  labs(subtitle = "filtering out top/bottom 1% of views and comments")
+```
+
+The correlation of views vs. number of comments is `r cor(ted_main_data$comments, ted_main_data$views)`
+
+Furthermore, the ratio of comments to views is also tested, and whilst there is a moderate distribution in the comments rate, there is little predictive power in this metric (cor = `r cor(ted_main_data$comments/ted_main_data$views, ted_main_data$views)`) as show below:
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+#test "rate of comments" as % of total views, expecting that there's a stronger link btw # of comments and ratings
+ted_main_data %>%
+  mutate(comments_rate = comments/views) %>%
+  filter(between(views, quantile(views, 0.01), quantile(views, 0.99))) %>%
+  filter(between(comments_rate, quantile(comments_rate, 0.01), quantile(comments_rate, 0.99))) %>%
+  ggplot(aes(x = comments_rate, y = views)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE) +
+  xlab("comments per million views") + 
+  ggtitle("Views vs. comments/million views")
+
+```
+
+##### 3.2.3.2. Views vs. duration of talks
+
+The histogram of duration of talks shows a mean of `r round(mean(ted_main_data$duration)/60,3)` . . .
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+#3.3.2. duration
+ted_main_data %>%
+  mutate(duration_in_mins = duration/60) %>%
+  ggplot(aes(x = duration_in_mins)) + 
+  geom_histogram(bins = 25, color = "blue4", fill = "cornflowerblue") + 
+  ggtitle("Histogram of duration of TED Talks")
+```
+
+. . .  and plotting views vs. duration shows weak correlation on this dimension (cor = `r cor(ted_main_data$views, ted_main_data$duration)`)
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+ted_main_data %>%
+  mutate(duration_in_mins = duration/60) %>%
+  filter(between(views, quantile(views, 0.01), quantile(views, 0.99))) %>%
+  filter(between(duration_in_mins, quantile(duration_in_mins, 0.01), quantile(duration_in_mins, 0.99))) %>%
+  ggplot(aes(x = duration_in_mins, y = views)) + 
+  geom_point() + 
+  ggtitle("Plot of views vs. duration") + 
+  labs(subtitle = "filtering out top and bottom 1% outliers of views and durations") +
+  xlab("Duration (mins)") + 
+  geom_smooth(method = "lm", show.legend = TRUE)
+```
+
+A further hypothesis is that that word count of talks and speed of delivery (words per minute of delivery) might have some moderate impact on views and popularity. This is calculated from the below code, using the `wordcount()` function from the `ngram` library. 
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+#test for speed of talk - gauge of energy
+library(ngram)
+ted_transcripts_data_wordcount <- sapply(ted_transcripts_data$transcript, wordcount)
+names(ted_transcripts_data_wordcount) <- NULL
+
+ted_main_data %>%
+  mutate(word_speed = ted_transcripts_data_wordcount/(duration/60)) %>%
+  ggplot(aes(x = word_speed)) +
+  geom_histogram(bins = 25, color = "blue4", fill = "cornflowerblue") + 
+  ggtitle("Histogram of words per minute for TED Talks")
+
+ted_main_data %>%
+  mutate(word_speed = ted_transcripts_data_wordcount/(duration/60)) %>%
+  summarize(mean_word_speed = mean(word_speed), median_word_speed = median(word_speed), sd_word_speed = sd(word_speed)) %>% kable()
+```
+
+The mean word speed is `r round(mean(ted_transcripts_data_wordcount/(ted_main_data$duration/60)),1)`, which is in line with studies of speech rates, and is visualized in the above histogram. The correlation to views, however, is again shown to be weak (cor = `r cor(ted_transcripts_data_wordcount/(ted_main_data$duration/60), ted_main_data$views)`). 
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+ted_main_data %>%
+  mutate(word_speed = ted_transcripts_data_wordcount/(duration/60)) %>%
+  ggplot(aes(x = word_speed, y = views)) +
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE)
+
+```
+
+##### 3.2.3.3. Views vs. number of languages
+
+The number of languages that a given TED Talk is available in does show some correlation to views (cor = `r cor(ted_main_data$views, ted_main_data$languages)`). This can be expected - as the popularity of a talk rises (i.e. `views` increase) so there is a greater probability of translation of this talk into more languages to reach a greater audience. 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+# 3.3.3. languages
+
+ted_main_data %>% 
+  filter(views < 3e7) %>%
+  ggplot(aes(x = languages, y = views)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE) + 
+  ggtitle("Views vs. number of languages per TED talk") +
+  labs(subtitle = "filtered out outlying views > 3e7")
+```
+
+##### 3.2.3.4.	Views vs. number of speakers
+
+When analyzing the number of speakers per talk (`num_speakers`) one notes a very small sample of talks with >1 speaker (only `r round((ted_main_data %>% filter(num_speaker != 1) %>% nrow())/nrow(ted_main_data)*100, 2)`%), and illustrated in the below table. As such, this parameter is ignored for prediction purposes.
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+# 3.3.4. num_speakers
+ted_main_data %>%
+  group_by(num_speaker) %>%
+  summarize(n = n(), sum_of_views = as.numeric(sum(views)), average_views = as.numeric(sum(views)/n()))
+```
+
+##### 3.2.3.5. Views vs. number of TED Talks per speaker
+
+It's further hypothesized that the number of TED Talks that a given speaker has made would give some indication of their popularity, i.e. viewership.
+
+This relationship between average views vs. the number of talks given by a segment of speakers shows some directional correlation and this parameter will therefore be considered for predictive purposes.
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+# 3.3.4b. specific speakers
+
+ted_main_data %>%
+  group_by(main_speaker) %>%
+  summarize(number_of_talks_per_speaker = n(), views = sum(as.numeric(views)), average_views = views/number_of_talks_per_speaker) %>%
+  arrange(desc(number_of_talks_per_speaker)) %>%
+  group_by(number_of_talks_per_speaker) %>%
+  summarize(Number_talks_per_speaker = mean(number_of_talks_per_speaker), Total_views = sum(views), Number_of_talks = n(), Average_views = sum(views)/Number_of_talks/Number_talks_per_speaker) %>%
+  kable()
+
+ted_main_data %>%
+  group_by(main_speaker) %>%
+  summarize(number_of_talks_per_speaker = n(), views = sum(as.numeric(views)), average_views = views/number_of_talks_per_speaker) %>%
+  arrange(desc(number_of_talks_per_speaker)) %>%
+  group_by(number_of_talks_per_speaker) %>%
+  summarize(Number_talks_per_speaker = mean(number_of_talks_per_speaker), Total_views = sum(views), Number_of_talks = n(), Average_views = sum(views)/Number_of_talks/Number_talks_per_speaker) %>%
+  ggplot(aes(x = Number_talks_per_speaker, y = Average_views)) + 
+  geom_col(color = "blue4", fill = "cornflowerblue") + 
+  geom_smooth(method = "lm") +
+  ggtitle("Average views per number of talks per speaker") + 
+  xlab("Number of talks per speaker") + 
+  ylab("Average views") + 
+  geom_label(aes(label = formatC(Average_views, format = "d", big.mark = ","))) +
+  scale_x_continuous(breaks = seq(1, 9))
+```
+
+##### 3.2.3.6.	Views vs. published date
+The date of publishing shows a fairly uniform distribution over time, and a low correlation (cor = `r cor(as.numeric(ted_main_data$published_date), ted_main_data$views)`). This parameter is also ignored in subsequent modelling.
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+# 3.3.5. publish date
+ted_main_data %>%
+  ggplot(aes(x = published_date)) + 
+  geom_histogram(binwidth = 365, color = "blue4", fill="cornflowerblue") + 
+  ggtitle("Histogram of published dates")
+
+ted_main_data %>%
+  ggplot(aes(x = published_date, y = views)) + geom_point() + geom_smooth(method = "lm", show.legend = TRUE)
+```
+
+##### 3.2.3.7.	Views vs. ratings
+The total number of ratings vs. views is seen to strongly correlate (cor = `r cor(ted_main_data$views, rowSums(ted_main_data_ratings_matrix))`) and is illustrated in the below graph that filters out the top and bottom 1% of views and count of ratings
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+#3.3.6. Ratings
+#plot correlation btw views and total ratings
+ted_main_data %>%
+  mutate(total_no_of_ratings = rowSums(ted_main_data_ratings_matrix)) %>%
+  filter(total_no_of_ratings < 25000) %>%
+  ggplot(aes(x = total_no_of_ratings, y = views)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE) + 
+  ggtitle("Correlation of total ratings vs. views") + 
+  labs(subtitle = "filtered for far outliers, ratings > 25000")
+```
+
+The correlation is further tested for the specific ratings categories, and one sees that those ratings with a more positive sentiment towards the talk show a stronger correlation to views. 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+# correlation of views vs. specific rating categories
+tmp <- cor(ted_main_data$views, ted_main_data_ratings_matrix) %>%
+  sort(decreasing = TRUE)
+names(tmp) <- colnames(ted_main_data_ratings_matrix)
+kable(tmp, col.names = "Correlation")
+```
+
+
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+#plot correlation btw views and net positive ratings
+
+ted_main_data %>%
+  mutate(net_no_of_positive_ratings = rowSums(ted_main_data_ratings_matrix %*% ifelse(ratings_sentiment, 1, -1))) %>%
+  filter(between(views, quantile(views, 0.01), quantile(views, 0.99))) %>%
+  filter(between(net_no_of_positive_ratings, quantile(net_no_of_positive_ratings, 0.01), quantile(net_no_of_positive_ratings, 0.99))) %>%
+  ggplot(aes(x = net_no_of_positive_ratings, y = views)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE) +
+  ggtitle("Views vs. count of net positive ratings per TED Talk") +
+  labs(subtitle = "Filtered out top/bottom 1% of views and net ratings") +
+  xlab("Net positive ratings, i.e. sum of positive ratings less sum of negative ratings")
+
+#test correlation with net positive ratings
+#cor(ted_main_data$views, rowSums(ted_main_data_ratings_matrix %*% ifelse(ratings_sentiment, 1, -1)))
+
+#test correlation with only sum of positive ratings
+#cor(ted_main_data$views, rowSums(ted_main_data_ratings_matrix %*% ifelse(ratings_sentiment, 1, 0)))
+```
+
+##### 3.2.3.8. Views vs. sentiment analysis on transcripts
+
+Finally, the dataset is tested for correlations between the number of views and the sentiment analysis applied to the associated transcripts of each TED Talk.
+
+###### *Bing Lexicon*
+
+Using the bing lexicon, with a count of positive and negative word sentiments per TED Talk, we can see a distribution of the net sentiment across all talks. 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+#3.3.7. Sentiment analysis vs. views
+ted_transcript_sentiment_bing %>% 
+  ungroup() %>% 
+  mutate(net_pos_neg = positive - negative) %>%
+  arrange(desc(net_pos_neg)) %>%
+  ggplot(aes(x = reorder(url, -net_pos_neg), y = net_pos_neg)) + geom_col() + theme(axis.text.x = element_blank(), axis.ticks = element_blank()) + xlab("Sorted TED Talks") + ggtitle("Distribution of net sentiment scores (bing) across TED Talks dataset")
+```
+
+Those talks with the most positive net sentiment measured are:
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+# top 10 by net positive sentiment
+ted_transcript_sentiment_bing %>% 
+  ungroup() %>% 
+  mutate(net_pos_neg = positive - negative) %>%
+  arrange(desc(net_pos_neg)) %>%
+  top_n(., 10) %>%
+  inner_join(., ted_main_data, "url") %>%
+  select(title, negative, positive, net_pos_neg, views) %>%
+  kable()
+```
+
+. . . and similarly the 10 most negative net sentiment talks are: 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+# bottom 10 by net positive sentiment
+ted_transcript_sentiment_bing %>% 
+  ungroup() %>% 
+  mutate(net_pos_neg = positive - negative) %>%
+  arrange(desc(net_pos_neg)) %>%
+  top_n(., -10) %>%
+  inner_join(., ted_main_data, "url") %>%
+  select(title, negative, positive, net_pos_neg, views) %>%
+  kable()
+```
+
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+tmp <- (inner_join(ted_transcript_sentiment_bing, ted_main_data, by = "url") %>% 
+          mutate(net_pos_neg = positive - negative) %>%
+          na.omit())
+
+```
+
+Testing the correlation between net sentiment of a given talk and total views shows a correlation of `r cor(tmp$views, tmp$net_pos_neg)`, illustrated below: 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+# test correlation on net positive/negative
+inner_join(ted_transcript_sentiment_bing, ted_main_data, by = "url") %>%
+  filter(views < quantile(ted_main_data$views, 0.99)) %>%
+  mutate(net_pos_neg = positive - negative) %>%
+  ggplot(aes(x = net_pos_neg, y = views)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE) + 
+  ggtitle("Views vs. net of positive and negative sentiment")
+
+tmp <- (inner_join(ted_transcript_sentiment_bing, ted_main_data, by = "url") %>% 
+          mutate(spread_pos_neg = positive + negative) %>%
+          na.omit())
+```
+
+
+Testing correlation against the spread of sentiment, i.e. TED Talks with a wide range of positive and negative sentiment in a single talk, shows a weak correlation of `r cor(tmp$views, tmp$spread_pos_neg)`. 
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+# test correlation on spread of positive/negative
+inner_join(ted_transcript_sentiment_bing, ted_main_data, by = "url") %>%
+  filter(views < quantile(ted_main_data$views, 0.99)) %>% 
+  mutate(spread_pos_neg = positive + negative) %>%
+  ggplot(aes(x = spread_pos_neg, y = views)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE) +
+  ggtitle("Views vs. net of positive and negative sentiment") + 
+  labs(subtitle = "Filtered out top 1% of views")
+```
+
+###### *NRC Emotional Lexicon*
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE}
+tmp <- (inner_join(ted_transcript_sentiment_bing, ted_main_data, by = "url") %>% 
+          mutate(spread_pos_neg = positive + negative) %>%
+          na.omit())
+```
+
+The NRC lexicon categorises single words into one of 8 categories, i.e. positive, negative, anger, anticipation, disgust, fear, joy, sadness, surprise, and trust. Filtering for the positive and negative sentiment from the nrc classification, this yields very similar results to the bing lexicon, i.e. a correlation to views of `r cor(tmp$views, tmp$spread_pos_neg)` and a similar graphical correlation.
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+# repeating at a high level for the nrc lexicon
+inner_join(ted_transcript_sentiment_nrc, ted_main_data, by = "url") %>%
+  filter(views < quantile(ted_main_data$views, 0.99)) %>% 
+  mutate(spread_pos_neg = positive + negative) %>%
+  ggplot(aes(x = spread_pos_neg, y = views)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", show.legend = TRUE) +
+  ggtitle("Views vs. net of positive and negative sentiment") + 
+  labs(subtitle = "Filtered out top 1% of views")
+```
+
+###3.3. Prediction modelling
+
+With a set of parameters identified to support prediction, a series of models are tested for prediction of the viewership. The relative popularity of TED Talks, as measured by viewership (`views`) is the parameter for prediction. The modelling looks to predict a talk's popularity by categorizing talks into quartiles, `views_quartile`, and measuring prediction accuracy vs. the quartile.
+
+In practical applications, where one wants to predict the future popularity of a talk, one does not have access to viewership and ratings feedback. Some of the TED Talk dataset, e.g. languages, are likely a consequence of talk popularity (popular talks get translated into more languages), and are thus a lagging indicator of popularity.
+
+The below models predict popularity from 2 datasets that select from parameters prepared above:
+
+* The first is a more expansive dataset and shows higher predictive power. This includes parameters like languages and ratings. In reality, one would not have access to all of this information before a talk is published and feedback on the talk is gathered. 
+* The second set of models attempts to predict talk popularity based upon only those parameters known prior to the talk airing, e.g. the talk topic (`tags`), the speaker, sentiment analysis of the transcript, talk duration, the number of talks the speaker has done to date.
+
+### 3.3.1. Dataset 1
+We set up training dataset 1 per the below code:
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6}
+library(caret)
+set.seed(1)
+
+#prepare final dataset for training
+final_data_set <- ted_main_data %>% 
+  mutate(views_quartile = ntile(views, 4)) %>% # add quartiles of views as a new parameter
+  mutate(number_of_ratings = rowSums(ted_main_data_ratings_matrix)) %>% #add total no. of ratings
+  mutate(net_no_of_positive_ratings = rowSums(ted_main_data_ratings_matrix %*% ifelse(ratings_sentiment, 1, -1))) #add sum of net positive ratings
+
+#join sentiment analysis to ted_main_data
+names(ted_transcript_sentiment_bing)[-1] <- paste("bing_", names(ted_transcript_sentiment_bing)[-1], sep ="")
+final_data_set <- inner_join(final_data_set, ted_transcript_sentiment_bing, "url")
+
+names(ted_transcript_sentiment_nrc)[-1] <- paste("nrc_", names(ted_transcript_sentiment_nrc)[-1], sep = "")
+final_data_set <- inner_join(final_data_set, ted_transcript_sentiment_nrc, "url")
+
+final_data_set <- final_data_set %>% 
+  mutate(bing_spread_sentiment = bing_positive+bing_negative) %>% #add sentiment spread per bing
+  mutate(nrc_spread_sentiment = nrc_positive+nrc_negative) %>% #add sentiment spread per nrc
+  filter(complete.cases(.)) #confirm complete cases for entire dataset
+
+# prepare training and test sets
+training_sample_percent <- 1 # choose to first model off of a subset of ted_main_data (to prove algorithms and increase run speed whilst testing models)
+final_data_subset <- final_data_set[sample(final_data_set$comments, size = floor(nrow(final_data_set) * training_sample_percent), replace = FALSE), ]
+final_data_subset <- final_data_subset %>% filter(complete.cases(.))
+
+train_index <- createDataPartition(final_data_subset$views, times = 1, p = 0.8, list = FALSE)
+train_set <- final_data_subset[train_index, ]
+test_set <- final_data_subset[-train_index, ]
+```
+
+The 3 models that follow - `knn`, `rborist` and `ranger` - are trained on the following parameters, selected from the compiled training set:
+
+* `comments`
+* Talk `duration`
+* `languages`
+* The main speaker, `main_speaker`
+* The number of talks by the speaker, `num_speaker`
+* The total `number_of_ratings` received per talk
+* The nett number of positive ratings received, `net_no_of_positive_ratings`
+* The spread of sentiment using the bing lexicon, i.e. the count of positive sentiments + the count of negative sentiments -  `bing_spread_sentiment`
+* The spread of sentiment using the NRC lexicon - `nrc_spread_sentiment`
+
+The first round of models do not include:
+
+* The topic tags as a predictor (given the exponential growth in the modelling parameters when including these)
+* The more detailed categorisations of ratings
+* The specific sentiments isolated by the NRC sentiment analysis (beyond simply the positive and negative impacts)
+* Other parameters which showed low correlation from the exploratory analysis phase, e.g. published_date
+
+#### Model 1: knn
+A k-nearest neighbours model is set up with 5-fold repeated cross-validation (3 repeats) and a tuning range of k neighbours of `seq(3, 15, 3)`.
+
+``` {r knn_train, echo=TRUE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6} 
+
+# model 1: knn 
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, verboseIter = FALSE) 
+k_tune_df <- data.frame(k = seq(3, 15, 3)) 
+train_knn <- train(form = views_quartile ~ ., 
+                   data = train_set %>% 
+                     select(views_quartile, comments, duration, languages, 
+                            num_speaker, number_of_ratings, 
+                            net_no_of_positive_ratings, bing_spread_sentiment, nrc_spread_sentiment), 
+                   method = "knn", 
+                   trControl = ctrl, 
+                   preProcess = c("center", "scale"), 
+                   tuneGrid = k_tune_df)
+
+conf_matrix_knn <- confusionMatrix(data = as.factor(round(predict(train_knn, test_set),0)), reference = as.factor(test_set$views_quartile)) 
+```
+
+This model yields an overall accuracy of `r conf_matrix_knn$overall[["Accuracy"]]`, and the tuned model is optimized at k = `r train_knn$bestTune[1]`, seen in the below plot.
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6} 
+ggplot(train_knn, highlight = TRUE) + ggtitle("knn training results, tuned for k neighbours")
+```
+
+
+The table of predicted vs. reference results furthermore shows that the error rate for those talks which are classified as more than 1 quartile removed from actual is very low.
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE} 
+conf_matrix_knn$table
+```
+
+A simple function is defined to calculate the accuracy to within 1 quartile, `accuracy_1_quartile`, listed below:
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE} 
+accuracy_1_quartile <- function(x) {
+  1-sum(x[1, 3:4], x[2, 4], x[3, 1], x[4, 1:2])/sum(x)
+}
+```
+
+. . . and calling `accuracy_1_quartile` for the results table from the knn fit yields an accuracy of `r round(accuracy_1_quartile(conf_matrix_knn$table), 2)`.
+
+The specific test results for each of the quartiles are also displayed below:
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE} 
+train_knn$results %>% kable
+```
+
+#### Model 2: Rborist
+
+The Rborist training method implements a random forest algorithm. This is set up with 5-fold repeated cross validation for 3 repeats, and is tuned for the minimal number of rows to split a node (`minNode = seq(3,15,3)`). This model is shown below.
+
+``` {r rborist_train, echo=TRUE, message=FALSE, warning=FALSE} 
+# model 2: rborist 
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, verboseIter = FALSE)
+tune_Rborist <- data.frame(predFixed = 2, minNode = seq(3,15,3)) 
+train_Rborist <- train(form = views_quartile ~ ., 
+                       data = train_set %>% 
+                         select(views_quartile, comments, duration, languages, 
+                                num_speaker, number_of_ratings, 
+                                net_no_of_positive_ratings, bing_spread_sentiment, nrc_spread_sentiment), 
+                       method = "Rborist", 
+                       trControl = ctrl, 
+                       preProcess = c("center", "scale"), 
+                       tuneGrid = tune_Rborist)
+
+conf_matrix_rborist <- confusionMatrix(data = as.factor(round(predict(train_Rborist, test_set),0)), reference = as.factor(test_set$views_quartile))
+```
+
+The model optimizes for `minNode` = `r train_Rborist$bestTune[2]` and delivers an overall accuracy of `r conf_matrix_rborist$overall[["Accuracy"]]`. The model results are included below:
+
+``` {r echo=TRUE, message=FALSE, warning=FALSE} 
+ggplot(train_Rborist, highlight = TRUE) + ggtitle("Rborist training results, tuned for minNodes") 
+conf_matrix_rborist$table 
+conf_matrix_rborist$byClass %>% kable
+```
+
+Finally, the accuracy to within one quartile (`accuracy_1_quartile`) is also calculated as `r round(accuracy_1_quartile(conf_matrix_rborist$table), 2)`.
+
+#### Model 3: Ranger
+
+The `ranger` method (RANdom forest GEneRator) is cited as a random forest training method well-suited to higher dimensionality data and yields fast and memory-efficient results. The `ranger` model is also set up with 5-fold repeated cross validation for 5 repeats. Ranger optimizes on  `min.node.size` per the below code:
+
+``` {r ranger_train, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6} 
+# model 3: ranger
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, verboseIter = FALSE)
+tune_ranger <- expand.grid(.mtry = 2:5, .splitrule = "extratrees", .min.node.size = seq(3,15,3))
+train_ranger <- train(form = views_quartile ~ ., 
+                       data = train_set %>% select(views_quartile, comments, duration, languages, 
+                                                   num_speaker, number_of_ratings, 
+                                                   net_no_of_positive_ratings, bing_spread_sentiment, nrc_spread_sentiment),
+                       method = "ranger",
+                       trControl = ctrl, 
+                       preProcess = c("center", "scale"),
+                       tuneGrid = tune_ranger)
+conf_matrix_ranger <- confusionMatrix(data = as.factor(round(predict(train_ranger, test_set),0)), 
+                                      reference = as.factor(test_set$views_quartile))
+```
+
+The ranger model delivers an overall accuracy of `r conf_matrix_ranger$overall[["Accuracy"]]`, and an accuracy to within 1 quartile of `r accuracy_1_quartile(conf_matrix_ranger$table)`. The model results are further visualised below:
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6} 
+ggplot(train_ranger, highlight = TRUE) + ggtitle("Ranger training results, tuned for min.node.size")
+conf_matrix_ranger$table
+conf_matrix_ranger$byClass %>% kable
+```
+
+### 3.3.2. Dataset 2
+
+At time of publication of a TED Talk, not all information will be available, e.g. comments, ratings, translation into further languages, etc. Further models are trained on the following parameters to profile the topic and speaker popularity:
+
+* Talk `duration`
+* The `main_speaker`
+* The number of talks by the speaker, `num_speaker`
+* The spread of sentiment using the bing lexicon, i.e. the count of positive sentiments + the count of negative sentiments -  `bing_spread_sentiment`
+* The spread of sentiment using the NRC lexicon - `nrc_spread_sentiment`
+* The topic `tags`
+
+The second dataset is prepared using the following code:
+
+``` {r prep_dataset_2, echo=TRUE, message=FALSE, warning=FALSE} 
+#Dataset 2: no a priori parameters to train on
+set.seed(1)
+#prepare final dataset for training
+final_data_set <- ted_main_data %>% 
+  mutate(views_quartile = ntile(views, 4)) # add quartiles of views as a new parameter
+
+colnames(tags_matrix) <- paste("tag_", colnames(tags_matrix), sep = "") # rename columns in tags matrix
+final_data_set <- cbind(final_data_set, tags_matrix) # add on tags matrix to ted_main_data
+
+#join sentiment analysis to ted_main_data
+final_data_set <- inner_join(final_data_set, ted_transcript_sentiment_bing, "url")
+
+#names(ted_transcript_sentiment_nrc)[-1] <- paste("nrc_", names(ted_transcript_sentiment_nrc)[-1], sep = "")
+final_data_set <- inner_join(final_data_set, ted_transcript_sentiment_nrc, "url")
+
+final_data_set <- final_data_set %>% 
+  mutate(bing_spread_sentiment = bing_positive+bing_negative) %>% #add sentiment spread per bing
+  mutate(nrc_spread_sentiment = nrc_positive+nrc_negative) %>% #add sentiment spread per bing
+  filter(complete.cases(.)) #confirm complete cases for entire dataset
+
+#filter out parameters not used for training, incl. those that will only be known after talk release and feedback from viewers
+final_data_set <- final_data_set %>% select(-languages, -ratings, -description, -related_talks, -event, -name, -tags, 
+                                            -speaker_occupation, -main_speaker, -title, -url, -views)
+
+# prepare training and test sets
+training_sample_percent <- 1 # choose to first model off of a subset of ted_main_data (to prove algorithms and increase run speed whilst testing models)
+final_data_subset <- final_data_set[sample(final_data_set$comments, size = floor(nrow(final_data_set) * training_sample_percent), replace = FALSE), ]
+final_data_subset <- final_data_subset %>% filter(complete.cases(.))
+
+train_index <- createDataPartition(final_data_subset$views, times = 1, p = 0.8, list = FALSE)
+train_set <- final_data_subset[train_index, ]
+test_set <- final_data_subset[-train_index, ]
+```
+
+This second dataset has many more parameters, `r dim(train_set)[1]` rows x `r dim(train_set)[2]` colums, and as such a single training method, `ranger`, is applied to the dataset. `Ranger` is well-suited to fast random forest implementations of higher dimensional datasets. In earlier code development it was seen to perform better than `knn`, `rborist` and simple `rf` methods. 
+
+#### Model 1: Ranger
+
+The `ranger` model on dataset 2 is configured and executed as per below, with a 5-fold 3 repeat cross validation and tuning for a range of `mtry` and `min.node.size`:
+
+``` {r train_ranger_2, echo=TRUE, message=FALSE, warning=FALSE} 
+# model 1: ranger
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, verboseIter = FALSE)
+tune_ranger <- expand.grid(.mtry = seq(5,25,5), .splitrule = "extratrees", .min.node.size = seq(3,15,3))
+
+train_ranger2 <- train(form = views_quartile ~ ., 
+                   data = train_set,
+                   method = "ranger",
+                   trControl = ctrl, 
+                   preProcess = c("center", "scale"),
+                   tuneGrid = tune_ranger)
+conf_matrix_ranger2 <- confusionMatrix(data = as.factor(round(predict(train_ranger2, test_set),0)), 
+                                    reference = as.factor(test_set$views_quartile))
+```
+
+The ranger model delivers an overall accuracy of `r conf_matrix_ranger2$overall[["Accuracy"]]`, and an accuracy to within 1 quartile of `r accuracy_1_quartile(conf_matrix_ranger2$table)`. The model results are further visualised below:
+
+``` {r echo=FALSE, message=FALSE, warning=FALSE, fig.height = 4, fig.width = 6} 
+ggplot(train_ranger2, highlight = TRUE) + ggtitle("Ranger training results, tuned for mtry and min.node.size")
+conf_matrix_ranger2$table
+conf_matrix_ranger2$byClass %>% kable
+```
+
+##4. Results
+
+### 4.1. Results - parameters with audience feedback data
+
+Consolidating these results, and evaluating on overall average, we see the relative performance of the various models on the given train and test datasets.
+
+``` {r dataset1_summary_results, echo=TRUE, message=FALSE, warning=FALSE}
+df_dataset1_results <- data.frame(name = character(), 
+                                  accuracy = numeric())
+
+df_dataset1_results <- rbind(df_dataset1_results,
+                          data_frame(name = "knn", accuracy = conf_matrix_knn$overall[["Accuracy"]]),
+                          data_frame(name = "rborist", accuracy = conf_matrix_rborist$overall[["Accuracy"]]), 
+                          data_frame(name = "ranger", accuracy = conf_matrix_ranger$overall[["Accuracy"]]))
+
+tmp <- c(accuracy_1_quartile(conf_matrix_knn$table), 
+         accuracy_1_quartile(conf_matrix_rborist$table), 
+         accuracy_1_quartile(conf_matrix_ranger$table))
+
+df_dataset1_results <- cbind(df_dataset1_results, tmp)
+names(df_dataset1_results)[3] <- "Accuracy to 1 quartile"
+df_dataset1_results %>% kable
+```
+
+From the first dataset we see that the `r df_dataset1_results$name[which.max(df_dataset1_results$accuracy)]` model performs best, with an overall accuracy of `r df_dataset1_results$accuracy[which.max(df_dataset1_results$accuracy)]` and accuracy to within 1 quartile of `r df_dataset1_results$"Accuracy to 1 quartile"[which.max(df_dataset1_results$accuracy)]`.
+
+For the purposes of selecting media content likely to be popular to audiences, this accuracy is very high, and there will also be a step of human oversight before finalizing programming to validate model recommendations.
+
+### 4.2. Results - parameters at date of publication
+
+Predicting talk popularity at time of publication is more difficult, given lack of audience feedback, hence the training parameters were significantly broadened (e.g. `tags`, `detailed sentiment parameters`). From the second dataset, the ranger model selected performs well (given the train and test sets under consideration), with an overall accuracy of `r conf_matrix_ranger2$overall[["Accuracy"]]`, and an accuracy to within 1 quartile of `r accuracy_1_quartile(conf_matrix_ranger2$table)`.
+
+This accuracy is also sufficiently high to validate the model use as a decision-making tool for media programming. 
+
+##5. Conclusions and next steps
+
+This project explores methods to predict TED Talk popularity. One notes that the ability to predict talk popularity (as measured by viewership levels) is strengthened with feedback information from the talks after publication, e.g. with comments/ratings/languages data available. The overall accuracy of classification of TED Talks into quartiles of viewership is `r round(df_dataset1_results$accuracy[which.max(df_dataset1_results$accuracy)],4)` using data parameters gathered after a talk has been published and feedback is received.
+
+The accuracy drops to `r round(conf_matrix_ranger2$overall[["Accuracy"]],4)` (and `r round(accuracy_1_quartile(conf_matrix_ranger2$table),4)` if measuring accuracy to within one quartile of actual classification).
+
+This indicates that prediction of viewership from the more limited parameters of speaker, topic tags and transcript sentiment analysis is still possible and of value in commercial application. To further improve upon this prediction, further investigation is proposed to:
+
+* Refine the tuning parameters on the models applied in this project; 
+* Test alternative goal functions to evaluate overall model strength, e.g. forecasting actual viewership, F1 scores to incorporate precision and recall, etc.;
+* Conduct principle component analysis to identify greatest sources of variance driving model prediction, and use this information to deepen the datasets for relevant predictors;
+* Evaluate additional training algorithms beyond the knn, random forest and simple neural network approaches above;
+* Augment the existing TED Talks dataset with other media content datasets, to broaden the sample size to predict content popularity;
+* Augment with audience data to better profile popularity to the target audience.
+
+
+
+***
+
+
+I would like to acknowledge and thank Prof Irizarry and his broader team for creating and investing time into this HarvardX Data Science course, without which I would not have been able to learn about and explore this topic to this extent.
